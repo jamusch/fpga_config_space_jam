@@ -12,6 +12,10 @@
 #include <linux/version.h>
 #include <linux/miscdevice.h>
 
+#include <linux/mm.h>
+#include <linux/sysfs.h>
+
+
 #include <asm/io.h>
 #include <asm/spinlock.h>
 #include <asm/byteorder.h>
@@ -28,6 +32,95 @@
 #endif
 
 static unsigned int debug = 0;
+
+
+#define pcie_wb_dbg( args... )                    \
+  if(debug) printk( args );
+
+#define pcie_wb_msg( args... )                    \
+  printk( args );
+
+/** hold full device number JAM2018 */
+
+
+
+static dev_t pcie_wb_devt;
+static atomic_t pcie_wb_numdevs = ATOMIC_INIT(0);
+static int my_major_nr = 0;
+
+
+//-----------------------------------------------------------------------------
+struct file_operations pcie_wb_fops = {
+    .owner = THIS_MODULE,
+    .mmap = pcie_wb_mmap,
+    .open = pcie_wb_open,
+    .release = pcie_wb_release, };
+//-----------------------------------------------------------------------------
+
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,18)
+static struct class* pcie_wb_class;
+
+static DEVICE_ATTR(codeversion, S_IRUGO, pcie_wb_sysfs_codeversion_show, NULL);
+static DEVICE_ATTR(dactl, S_IWUGO | S_IRUGO, pcie_wb_sysfs_dactl_show, pcie_wb_sysfs_dactl_store);
+
+
+ssize_t pcie_wb_sysfs_codeversion_show (struct device *dev, struct device_attribute *attr, char *buf)
+{
+  ssize_t curs = 0;
+  curs += snprintf (buf + curs, PAGE_SIZE, "*** This is %s, version %s build on %s at %s \n",
+     PCIE_WB_DESC, PCIE_WB_VERSION, __DATE__, __TIME__);
+  curs += snprintf (buf + curs, PAGE_SIZE, "\tmodule authors: %s \n", PCIE_WB_AUTHORS);
+  curs += snprintf (buf + curs, PAGE_SIZE, "\tPrepared for direct TLU access for MBS DAQ \n");
+  return curs;
+}
+
+
+ssize_t  pcie_wb_sysfs_dactl_show (struct device *dev, struct device_attribute *attr, char *buf)
+{
+  ssize_t curs = 0;
+  u32* reg=0;
+  unsigned int val=0;
+  struct pcie_wb_dev *privdata;
+  privdata = (struct pcie_wb_dev *) dev_get_drvdata (dev);
+
+  reg = (u32*)(privdata->pci_res[0].addr + DIRECT_ACCESS_CONTROL);
+  val=ioread32 (reg);
+  pcie_wb_msg( KERN_NOTICE "PCIE_WB: read from dactl register the value 0x%x\n", val);
+  curs += snprintf (buf + curs, PAGE_SIZE - curs, "%d\n", val);
+  return curs;
+}
+
+ssize_t  pcie_wb_sysfs_dactl_store (struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+  unsigned int val=0;
+  u32* reg=0;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,2,0)
+  int rev=0;
+#else
+  char* endp=0;
+#endif
+  struct pcie_wb_dev *privdata;
+  privdata = (struct pcie_wb_dev*) dev_get_drvdata (dev);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,2,0)
+  rev=kstrtouint(buf,0,&val); // this can handle both decimal, hex and octal formats if specified by prefix JAM
+  if(rev!=0) return rev;
+#else
+  val=simple_strtoul(buf,&endp, 0);
+  count= endp - buf; // do we need this?
+#endif
+   reg = (u32*)(privdata->pci_res[0].addr + DIRECT_ACCESS_CONTROL);
+   iowrite32(val,reg);
+   pcie_wb_msg( KERN_NOTICE "PCIE_WB: wrote to dactl register the value 0x%x\n", val);
+  return count;
+}
+
+
+
+
+#endif
+
+
 
 #if LINUX_VERSION_CODE <= KERNEL_VERSION(2,6,28)
 
@@ -303,6 +396,111 @@ static void destroy_bar(struct pcie_wb_resource* res)
 	release_mem_region(res->start, res->size);
 }
 
+
+/** JAM2018 - new file operation to map bar adress to user space for direct access TLU*/
+
+
+int pcie_wb_open (struct inode *inode, struct file *filp)
+{
+  struct pcie_wb_dev *dev;      // device information
+  pcie_wb_dbg(KERN_INFO "\nBEGIN pcie_wb_open \n");
+  dev = container_of(inode->i_cdev, struct pcie_wb_dev, cdev);
+  filp->private_data = dev;    // for other methods
+  pcie_wb_dbg(KERN_INFO "END   pcie_wb_open \n");
+  return 0;                   // success
+}
+//-----------------------------------------------------------------------------
+int pcie_wb_release (struct inode *inode, struct file *filp)
+{
+  pcie_wb_dbg(KERN_INFO "BEGIN pex_release \n");
+  pcie_wb_dbg(KERN_INFO "END   pex_release \n");
+  return 0;
+}
+
+int pcie_wb_mmap (struct file *filp, struct vm_area_struct *vma)
+{
+  /** JAM2018 : this function is a clone from the mmap of mbspex driver, adjusted to the case that
+   * we want bar1 exported to user space for direct TLU access. The functionality to map any physical memory
+   * is still provided, but not a use case for timing receiver*/
+
+
+  struct pcie_wb_dev *privdata;
+  int ret = 0;
+  unsigned long bufsize, barsize;
+  privdata = (struct pcie_wb_dev*) filp->private_data;
+  pcie_wb_dbg(KERN_NOTICE "** starting pcie_wb_mmap for vm_start=0x%lx\n", vma->vm_start);
+  if (!privdata)
+    return -EFAULT;
+  bufsize = (vma->vm_end - vma->vm_start);
+  pcie_wb_dbg(KERN_NOTICE "** starting pcie_wb_mmap for size=%ld \n", bufsize);
+
+  if (vma->vm_pgoff == 0)
+  {
+    /* user does not specify external physical address, we deliver mapping of bar 1 that will contain TLU register:*/
+    pcie_wb_dbg(
+        KERN_NOTICE "PCIe_Wishbone hardware is Mapping bar1 base address %lx / PFN %lx\n",  privdata->pci_res[1].start, privdata->pci_res[1].start >> PAGE_SHIFT);
+
+
+    barsize = privdata->pci_res[1].size;
+    if (bufsize > barsize)
+    {
+      pcie_wb_dbg(
+          KERN_WARNING "Requested length %ld exceeds bar0 size, shrinking to %ld bytes\n", bufsize, barsize);
+      bufsize = barsize;
+    }
+
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(3,7,0)
+    vma->vm_flags |= (VM_RESERVED);
+#else
+    vma->vm_flags |= (VM_DONTEXPAND | VM_DONTDUMP);
+#endif
+
+
+    ret = remap_pfn_range (vma, vma->vm_start, privdata->pci_res[1].start >> PAGE_SHIFT, bufsize, vma->vm_page_prot);
+  }
+  else
+  {
+    /* for external phys memory, use directly pfn*/
+    pcie_wb_dbg(
+        KERN_NOTICE "PCIe_Wishbone hardware is Mapping external address %lx / PFN %lx\n", (vma->vm_pgoff << PAGE_SHIFT ), vma->vm_pgoff);
+
+    /* JAM tried to check via bios map if the requested region is usable or reserved
+     * This will not work, since the e820map as present in Linux kernel was already cut above mem=1024M
+     * So we would need to rescan the original bios entries, probably too much effort if standard MBS hardware is known
+     * */
+    /* phstart=  (u64) vma->vm_pgoff << PAGE_SHIFT;
+     phend = phstart +  (u64) bufsize;
+     phtype = E820_RAM;
+     if(e820_any_mapped(phstart, phend, phtype)==0)
+     {
+     printk(KERN_ERR "PCIe_Wishbone hardware mmap: requested physical memory region  from %lx to %lx is not completely usable!\n", (long) phstart, (long) phend);
+     return -EFAULT;
+     }
+     NOTE that e820_any_mapped only checks if _any_ memory inside region is mapped
+     So it is the wrong method anyway?*/
+
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(3,7,0)
+    vma->vm_flags |= (VM_RESERVED);
+#else
+    vma->vm_flags |= (VM_DONTEXPAND | VM_DONTDUMP);
+#endif
+
+    ret = remap_pfn_range (vma, vma->vm_start, vma->vm_pgoff, bufsize, vma->vm_page_prot);
+
+  }
+
+  if (ret)
+  {
+    pcie_wb_msg(
+        KERN_ERR "PCIe_Wishbone hardware mmap: remap_pfn_range failed with %d\n", ret);
+    return -EFAULT;
+  }
+  return ret;
+}
+
+
+
+
 static int probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	/* Do probing type stuff here.  
@@ -312,6 +510,8 @@ static int probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	 * register char dev
 	 */
 	u8 revision;
+	int err=0;
+    char devname[64];
 	struct pcie_wb_dev *dev;
 	unsigned char* control;
 
@@ -354,6 +554,75 @@ static int probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	pci_set_master(pdev); /* enable bus mastering => needed for MSI */
 	
+	/*********************************************************************/
+	/** now provide own device for direct TLU functionalities JAM2018 :*/
+	 dev->devid = atomic_inc_return(&pcie_wb_numdevs) - 1;
+	 if (dev->devid >= PCIE_WB_MAXDEVS)
+	    {
+	      pcie_wb_msg(KERN_ERR "Maximum number of devices reached! Increase PCIE_WB_MAXDEVS.\n");
+	      goto fail_master;
+	    }
+	 dev->devno = MKDEV(MAJOR(pcie_wb_devt), MINOR(pcie_wb_devt) + dev->devid);
+
+
+	  /* Register character device */
+	 cdev_init (&(dev->cdev), &pcie_wb_fops);
+	 dev->cdev.owner = THIS_MODULE;
+	 dev->cdev.ops = &pcie_wb_fops;
+	 err = cdev_add (&dev->cdev, dev->devno, 1);
+	 if (err)
+	    {
+	      pcie_wb_msg( "Couldn't add character device.\n");
+	      goto fail_cdev;
+	    }
+
+	 /* export special things to class in sysfs: */
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,18)
+    if (!IS_ERR (pcie_wb_class))
+    {
+      /* driver init had successfully created class, now we create device:*/
+      snprintf (devname, 64, "pcie_wb%d", MINOR(pcie_wb_devt) + dev->devid);
+  #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,27)
+      dev->class_dev = device_create (pcie_wb_class, NULL, dev->devno, dev, devname);
+  #else
+      dev->class_dev = device_create(pcie_wb_class, NULL,
+          dev->devno, devname);
+  #endif
+      dev_set_drvdata (dev->class_dev, dev);
+      pcie_wb_msg (KERN_NOTICE "Added PCIE_WB device: %s", devname);
+
+    // here the sysfs exports:
+
+      if (device_create_file (dev->class_dev, &dev_attr_codeversion) != 0)
+      {
+        pcie_wb_msg (KERN_ERR "Could not add device file node for code version.\n");
+        goto fail_sysfs;
+      }
+      if (device_create_file (dev->class_dev, &dev_attr_dactl) != 0)
+       {
+         pcie_wb_msg(KERN_ERR "Could not add device file node for direct access control register.\n");
+         goto fail_sysfs;
+       }
+
+    }
+    else
+     {
+       /* something was wrong at class creation, we skip sysfs device support here:*/
+       pcie_wb_msg(KERN_ERR "Could not add PCIE_WB device node to /dev !");
+       goto fail_sysfs;
+     }
+
+#endif
+
+/* JAM2018 end special things for direct TLU export handles
+**************************************************************************************/
+
+
+
+
+
+
 	/* enable message signaled interrupts */
 	if (pci_enable_msi(pdev) != 0) {
 		/* resort to legacy interrupts */
@@ -388,14 +657,31 @@ fail_msi:
 		pci_intx(pdev, 1);
 		pci_disable_msi(pdev);
 	}
-/*fail_master:*/
+
+fail_sysfs:
+  if (dev->class_dev)
+  {
+    device_remove_file (dev->class_dev, &dev_attr_dactl);
+    device_remove_file (dev->class_dev, &dev_attr_codeversion);
+  }
+  device_destroy (pcie_wb_class, dev->devno);
+
+
+fail_cdev:
+    cdev_del (&dev->cdev);
+    atomic_dec (&pcie_wb_numdevs);
+
+fail_master:
 	pci_clear_master(pdev);
-/*fail_bar1:*/
+
+	/*fail_bar1:*/
 	destroy_bar(&dev->pci_res[1]);
 fail_bar0:
 	destroy_bar(&dev->pci_res[0]);
 fail_free:
 	kfree(dev);
+
+
 fail_disable:
 	pci_disable_device(pdev);
 fail_out:
@@ -415,6 +701,19 @@ static void remove(struct pci_dev *pdev)
 		pci_intx(pdev, 1);
 		pci_disable_msi(pdev);
 	}
+
+	/************
+	 * clean up the sysfs stuff: */
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,18)
+  /* sysfs device cleanup */
+    device_remove_file (dev->class_dev, &dev_attr_dactl);
+    device_remove_file (dev->class_dev, &dev_attr_codeversion);
+    device_destroy (pcie_wb_class, dev->devno);
+#endif
+
+  /*** char device */
+
 	pci_clear_master(pdev);
 	destroy_bar(&dev->pci_res[1]);
 	destroy_bar(&dev->pci_res[0]);
@@ -437,16 +736,67 @@ static struct pci_driver pcie_wb_driver = {
 
 static int __init pcie_wb_init(void)
 {
-	return pci_register_driver(&pcie_wb_driver);
+  int result;
+  pcie_wb_devt = MKDEV(my_major_nr, 0);
+
+    /*
+     * Register your major, and accept a dynamic number.
+     */
+    if (my_major_nr)
+    {
+      result = register_chrdev_region (pcie_wb_devt, PCIE_WB_MAXDEVS, PCIE_WB_NAME);
+    }
+    else
+    {
+      result = alloc_chrdev_region (&pcie_wb_devt, 0, PCIE_WB_MAXDEVS, PCIE_WB_NAME);
+      my_major_nr = MAJOR(pcie_wb_devt);
+    }
+    if (result < 0)
+    {
+      pcie_wb_msg(
+          KERN_ALERT "Could not alloc chrdev region for major: %d !\n", my_major_nr);
+      return result;
+    }
+
+  #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,18)
+    pcie_wb_class = class_create (THIS_MODULE, PCIE_WB_NAME);
+    if (IS_ERR (pcie_wb_class))
+    {
+      pcie_wb_msg(KERN_ALERT "Could not create class for sysfs support!\n");
+    }
+#endif
+    if (pci_register_driver (&pcie_wb_driver) < 0)
+     {
+      pcie_wb_msg(KERN_ALERT "pci driver could not register!\n");
+       unregister_chrdev_region (pcie_wb_devt, PCIE_WB_MAXDEVS);
+       return -EIO;
+     }
+    pcie_wb_msg(
+         KERN_NOTICE "\t\tdriver init with registration for major no %d done.\n", my_major_nr);
+return 0;
+
 }
 
 static void __exit pcie_wb_exit(void)
 {	
-	pci_unregister_driver(&pcie_wb_driver);
+
+  unregister_chrdev_region (pcie_wb_devt, PCIE_WB_MAXDEVS);
+  pci_unregister_driver(&pcie_wb_driver);
+
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,18)
+   if (pcie_wb_class != NULL )
+     class_destroy (pcie_wb_class);
+ #endif
+
+
+
+
+
+
 }
 
-MODULE_AUTHOR("Stefan Rauch <s.rauch@gsi.de>");
-MODULE_DESCRIPTION("GSI Altera-Wishbone bridge driver");
+MODULE_AUTHOR(PCIE_WB_AUTHORS);
+MODULE_DESCRIPTION(PCIE_WB_DESC);
 module_param(debug, int, 0644);
 MODULE_PARM_DESC(debug, "Enable debugging information");
 MODULE_LICENSE("GPL");

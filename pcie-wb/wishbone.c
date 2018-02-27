@@ -28,7 +28,7 @@ static DEFINE_MUTEX(wishbone_mutex);
 static struct class *wishbone_master_class;
 static dev_t wishbone_master_dev_first;
 
-#if LINUX_VERSION_CODE <= KERNEL_VERSION(2,6,30)
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(2,6,30) || LINUX_VERSION_CODE > KERNEL_VERSION(3,1,19)
 
 /* missing 'const' in 2.6.30. present in 2.6.31. */
 static int compat_memcpy_fromiovecend(unsigned char *kdata, const struct iovec *iov,
@@ -54,6 +54,7 @@ static int compat_memcpy_fromiovecend(unsigned char *kdata, const struct iovec *
 
         return 0;
 }
+
 
 
 /* does not exist in 2.6.30. does in 2.6.31. */
@@ -82,6 +83,15 @@ static int compat_memcpy_toiovecend(const struct iovec *iov, unsigned char *kdat
 #define memcpy_toiovecend   compat_memcpy_toiovecend
 #define memcpy_fromiovecend compat_memcpy_fromiovecend
 #endif
+
+
+
+
+
+
+
+
+
 
 #if LINUX_VERSION_CODE <= KERNEL_VERSION(2,6,26)
 /* Older linux versions do not have the drvdata 'a' parameter. >= 2.6.37 present. */
@@ -524,6 +534,8 @@ static ssize_t char_master_aio_read(struct kiocb *iocb, const struct iovec *iov,
 	return len;
 }
 
+
+
 static ssize_t char_master_aio_write(struct kiocb *iocb, const struct iovec *iov, unsigned long nr_segs, loff_t pos)
 {
 	struct file *filep = iocb->ki_filp;
@@ -591,6 +603,32 @@ static int char_master_fasync(int fd, struct file *file, int on)
         return fasync_helper(fd, file, on, &context->fasync);
 }
 
+
+// JAM2016- give it a try for new kernel
+#if LINUX_VERSION_CODE > KERNEL_VERSION(4,1,0)
+static ssize_t char_master_aio_read_iter(struct kiocb *iocb, struct iov_iter *iter)
+{
+	return char_master_aio_read(iocb, iter->iov, iter->nr_segs, iter->iov_offset);
+}
+
+static ssize_t char_master_aio_write_iter(struct kiocb *iocb, struct iov_iter *iter)
+{
+
+	return char_master_aio_write(iocb, iter->iov, iter->nr_segs, iter->iov_offset);
+}
+
+#endif
+
+
+
+
+
+
+
+
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(4,1,0)
+
+
 static const struct file_operations etherbone_master_fops = {
         .owner          = THIS_MODULE,
         .llseek         = no_llseek,
@@ -603,6 +641,29 @@ static const struct file_operations etherbone_master_fops = {
         .release        = char_master_release,
         .fasync         = char_master_fasync,
 };
+
+#else
+
+static const struct file_operations etherbone_master_fops = {
+        .owner          = THIS_MODULE,
+        .llseek         = no_llseek,
+        //.read           = new_sync_read,
+        .read_iter      = char_master_aio_read_iter,
+        //.write          = new_sync_write,
+        .write_iter     = char_master_aio_write_iter,
+        .open           = char_master_open,
+        .poll           = char_master_poll,
+        .release        = char_master_release,
+        .fasync         = char_master_fasync,
+};
+
+
+
+#endif
+
+// ssize_t (*read_iter) (struct kiocb *, struct iov_iter *);
+//ssize_t (*write_iter) (struct kiocb *, struct iov_iter *);
+
 
 int wishbone_register(struct wishbone* wb)
 {
