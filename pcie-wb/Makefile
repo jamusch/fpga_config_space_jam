@@ -3,6 +3,10 @@ ifneq ($(KERNELRELEASE),)
 
 ccflags-y += -DGIT_REVISION="$(shell git --git-dir=$(src)/../.git log -n1 --pretty='format:%h (%ci)')"
 
+# following to get rid of kernel 4.9 errors:
+ccflags-y +=-Wno-date-time 
+
+
 obj-m += pcie_wb.o wishbone.o spec_wb.o
 # Only build wishbone-serial if it was missing
 ifneq ($(CONFIG_USB_SERIAL_WISHBONE),m)

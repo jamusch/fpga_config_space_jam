@@ -62,7 +62,10 @@ struct file_operations pcie_wb_fops = {
 static struct class* pcie_wb_class;
 
 static DEVICE_ATTR(codeversion, S_IRUGO, pcie_wb_sysfs_codeversion_show, NULL);
-static DEVICE_ATTR(dactl, S_IWUGO | S_IRUGO, pcie_wb_sysfs_dactl_show, pcie_wb_sysfs_dactl_store);
+//static DEVICE_ATTR(dactl, S_IWUGO | S_IRUGO, pcie_wb_sysfs_dactl_show, pcie_wb_sysfs_dactl_store);
+
+// new for kernel 4.9:
+static DEVICE_ATTR(dactl, (S_IWUSR| S_IWGRP | S_IRUGO), pcie_wb_sysfs_dactl_show, pcie_wb_sysfs_dactl_store);
 
 
 ssize_t pcie_wb_sysfs_codeversion_show (struct device *dev, struct device_attribute *attr, char *buf)
